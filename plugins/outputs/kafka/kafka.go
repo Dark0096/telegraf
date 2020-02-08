@@ -28,6 +28,7 @@ type (
 	Kafka struct {
 		Brokers          []string
 		Topic            string
+		UseBatchFormat   bool        `toml:"use_batch_format"`
 		ClientID         string      `toml:"client_id"`
 		TopicSuffix      TopicSuffix `toml:"topic_suffix"`
 		RoutingTag       string      `toml:"routing_tag"`
@@ -93,6 +94,11 @@ var sampleConfig = `
   brokers = ["localhost:9092"]
   ## Kafka topic for producer messages
   topic = "telegraf"
+
+  ## Use batch serialization format instead of line based delimiting.  The
+  ## batch format allows for the production of non line based output formats and
+  ## may more effiently encode metric groups.
+  # use_batch_format = false
 
   ## Optional Client id
   # client_id = "Telegraf"
@@ -347,32 +353,64 @@ func (k *Kafka) routingKey(metric telegraf.Metric) (string, error) {
 
 func (k *Kafka) Write(metrics []telegraf.Metric) error {
 	msgs := make([]*sarama.ProducerMessage, 0, len(metrics))
-	for _, metric := range metrics {
-		buf, err := k.serializer.Serialize(metric)
+
+	// TODO how to support before feature like routingKey, Tag, etc...
+	if k.UseBatchFormat {
+		buf, err := k.serializer.SerializeBatch(metrics)
 		if err != nil {
 			k.Log.Debugf("Could not serialize metric: %v", err)
-			continue
 		}
 
 		m := &sarama.ProducerMessage{
-			Topic: k.GetTopicName(metric),
+			Topic: k.Topic,
 			Value: sarama.ByteEncoder(buf),
 		}
 
 		// Negative timestamps are not allowed by the Kafka protocol.
-		if !metric.Time().Before(zeroTime) {
-			m.Timestamp = metric.Time()
+		for _, metric := range metrics {
+			if !metric.Time().Before(zeroTime) {
+				m.Timestamp = metric.Time()
+			}
 		}
 
-		key, err := k.routingKey(metric)
+		genKey, err := uuid.NewV4()
 		if err != nil {
 			return fmt.Errorf("could not generate routing key: %v", err)
 		}
 
+		key := genKey.String()
 		if key != "" {
 			m.Key = sarama.StringEncoder(key)
 		}
 		msgs = append(msgs, m)
+	} else {
+		for _, metric := range metrics {
+			buf, err := k.serializer.Serialize(metric)
+			if err != nil {
+				k.Log.Debugf("Could not serialize metric: %v", err)
+				continue
+			}
+
+			m := &sarama.ProducerMessage{
+				Topic: k.GetTopicName(metric),
+				Value: sarama.ByteEncoder(buf),
+			}
+
+			// Negative timestamps are not allowed by the Kafka protocol.
+			if !metric.Time().Before(zeroTime) {
+				m.Timestamp = metric.Time()
+			}
+
+			key, err := k.routingKey(metric)
+			if err != nil {
+				return fmt.Errorf("could not generate routing key: %v", err)
+			}
+
+			if key != "" {
+				m.Key = sarama.StringEncoder(key)
+			}
+			msgs = append(msgs, m)
+		}
 	}
 
 	err := k.producer.SendMessages(msgs)
